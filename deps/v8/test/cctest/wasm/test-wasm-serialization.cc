@@ -139,7 +139,8 @@ class WasmSerializationTest {
           v8::Context::New(serialization_v8_isolate);
       serialization_context->Enter();
 
-      auto enabled_features = WasmFeatures::FromIsolate(serialization_isolate);
+      auto enabled_features =
+          WasmEnabledFeatures::FromIsolate(serialization_isolate);
       MaybeHandle<WasmModuleObject> maybe_module_object =
           GetWasmEngine()->SyncCompile(
               serialization_isolate, enabled_features, compile_imports_,
@@ -151,7 +152,7 @@ class WasmSerializationTest {
       CHECK(weak_native_module.lock());
 
       v8::Local<v8::Object> v8_module_obj =
-          v8::Utils::ToLocal(Handle<JSObject>::cast(module_object));
+          v8::Utils::ToLocal(Cast<JSObject>(module_object));
       CHECK(v8_module_obj->IsWasmModuleObject());
 
       v8::Local<v8::WasmModuleObject> v8_module_object =
@@ -225,7 +226,7 @@ TEST(DeserializeWithSourceUrl) {
     const std::string url = "http://example.com/example.wasm";
     Handle<WasmModuleObject> module_object;
     CHECK(test.Deserialize(base::VectorOf(url)).ToHandle(&module_object));
-    Tagged<String> url_str = String::cast(module_object->script()->name());
+    Tagged<String> url_str = Cast<String>(module_object->script()->name());
     CHECK_EQ(url, url_str->ToCString().get());
   }
   test.CollectGarbage();
@@ -296,7 +297,7 @@ UNINITIALIZED_TEST(CompiledWasmModulesTransfer) {
     Isolate* from_i_isolate = reinterpret_cast<Isolate*>(from_isolate);
     testing::SetupIsolateForWasmModule(from_i_isolate);
     ErrorThrower thrower(from_i_isolate, "TestCompiledWasmModulesTransfer");
-    auto enabled_features = WasmFeatures::FromIsolate(from_i_isolate);
+    auto enabled_features = WasmEnabledFeatures::FromIsolate(from_i_isolate);
     MaybeHandle<WasmModuleObject> maybe_module_object =
         GetWasmEngine()->SyncCompile(
             from_i_isolate, enabled_features, CompileTimeImports{}, &thrower,
@@ -305,7 +306,7 @@ UNINITIALIZED_TEST(CompiledWasmModulesTransfer) {
         maybe_module_object.ToHandleChecked();
     v8::Local<v8::WasmModuleObject> v8_module =
         v8::Local<v8::WasmModuleObject>::Cast(
-            v8::Utils::ToLocal(Handle<JSObject>::cast(module_object)));
+            v8::Utils::ToLocal(Cast<JSObject>(module_object)));
     store.push_back(v8_module->GetCompiledModule());
     original_native_module = module_object->shared_native_module();
   }
@@ -320,8 +321,8 @@ UNINITIALIZED_TEST(CompiledWasmModulesTransfer) {
       v8::MaybeLocal<v8::WasmModuleObject> transferred_module =
           v8::WasmModuleObject::FromCompiledModule(to_isolate, store[0]);
       CHECK(!transferred_module.IsEmpty());
-      Handle<WasmModuleObject> module_object = Handle<WasmModuleObject>::cast(
-          v8::Utils::OpenHandle(*transferred_module.ToLocalChecked()));
+      DirectHandle<WasmModuleObject> module_object = Cast<WasmModuleObject>(
+          v8::Utils::OpenDirectHandle(*transferred_module.ToLocalChecked()));
       std::shared_ptr<NativeModule> transferred_native_module =
           module_object->shared_native_module();
       CHECK_EQ(original_native_module, transferred_native_module);
@@ -372,9 +373,9 @@ TEST(SerializeLiftoffModuleFails) {
   ErrorThrower thrower(isolate, "Test");
   MaybeHandle<WasmModuleObject> maybe_module_object =
       GetWasmEngine()->SyncCompile(
-          isolate, WasmFeatures::All(), CompileTimeImports{}, &thrower,
+          isolate, WasmEnabledFeatures::All(), CompileTimeImports{}, &thrower,
           ModuleWireBytes(wire_bytes_buffer.begin(), wire_bytes_buffer.end()));
-  Handle<WasmModuleObject> module_object =
+  DirectHandle<WasmModuleObject> module_object =
       maybe_module_object.ToHandleChecked();
 
   NativeModule* native_module = module_object->native_module();
@@ -401,7 +402,7 @@ TEST(SerializeTieringBudget) {
     memcpy(native_module->tiering_budget_array(), mock_budget,
            arraysize(mock_budget) * sizeof(uint32_t));
     v8::Local<v8::Object> v8_module_obj =
-        v8::Utils::ToLocal(Handle<JSObject>::cast(module_object));
+        v8::Utils::ToLocal(Cast<JSObject>(module_object));
     CHECK(v8_module_obj->IsWasmModuleObject());
 
     v8::Local<v8::WasmModuleObject> v8_module_object =
@@ -440,4 +441,33 @@ TEST(DeserializeTieringBudgetPartlyMissing) {
   }
   test.CollectGarbage();
 }
+
+TEST(SerializationFailsOnChangedFlags) {
+  WasmSerializationTest test;
+  {
+    HandleScope scope(CcTest::i_isolate());
+
+    FlagScope<bool> no_bounds_checks(&v8_flags.wasm_bounds_checks, false);
+    CHECK(test.Deserialize().is_null());
+
+    FlagScope<bool> bounds_checks(&v8_flags.wasm_bounds_checks, true);
+    CHECK(!test.Deserialize().is_null());
+  }
+}
+
+TEST(SerializationFailsOnChangedFeatures) {
+  WasmSerializationTest test;
+  {
+    HandleScope scope(CcTest::i_isolate());
+
+    CcTest::isolate()->SetWasmImportedStringsEnabledCallback(
+        [](auto) { return true; });
+    CHECK(test.Deserialize().is_null());
+
+    CcTest::isolate()->SetWasmImportedStringsEnabledCallback(
+        [](auto) { return false; });
+    CHECK(!test.Deserialize().is_null());
+  }
+}
+
 }  // namespace v8::internal::wasm

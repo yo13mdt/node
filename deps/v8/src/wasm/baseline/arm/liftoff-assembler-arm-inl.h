@@ -8,11 +8,12 @@
 #include "src/codegen/arm/assembler-arm-inl.h"
 #include "src/codegen/arm/register-arm.h"
 #include "src/common/globals.h"
-#include "src/heap/mutable-page.h"
+#include "src/heap/mutable-page-metadata.h"
 #include "src/wasm/baseline/liftoff-assembler.h"
 #include "src/wasm/baseline/liftoff-register.h"
 #include "src/wasm/baseline/parallel-move-inl.h"
 #include "src/wasm/object-access.h"
+#include "src/wasm/wasm-linkage.h"
 #include "src/wasm/wasm-objects.h"
 
 namespace v8::internal::wasm {
@@ -45,8 +46,6 @@ namespace liftoff {
 //
 static_assert(2 * kSystemPointerSize == LiftoffAssembler::kStackSlotSize,
               "Slot size should be twice the size of the 32 bit pointer.");
-constexpr int kInstanceDataOffset = 2 * kSystemPointerSize;
-constexpr int kFeedbackVectorOffset = 3 * kSystemPointerSize;
 // kPatchInstructionsRequired sets a maximum limit of how many instructions that
 // PatchPrepareStackFrame will use in order to increase the stack appropriately.
 // Three instructions are required to sub a large constant, movw + movt + sub.
@@ -62,7 +61,7 @@ inline MemOperand GetHalfStackSlot(int offset, RegPairHalf half) {
 }
 
 inline MemOperand GetInstanceDataOperand() {
-  return GetStackSlot(kInstanceDataOffset);
+  return GetStackSlot(WasmLiftoffFrameConstants::kInstanceDataOffset);
 }
 
 inline MemOperand GetMemOp(LiftoffAssembler* assm,
@@ -470,11 +469,14 @@ int LiftoffAssembler::PrepareStackFrame() {
 }
 
 void LiftoffAssembler::CallFrameSetupStub(int declared_function_index) {
-  // TODO(jkummerow): Enable this check when we have C++20.
-  // static_assert(std::find(std::begin(wasm::kGpParamRegisters),
-  //                         std::end(wasm::kGpParamRegisters),
-  //                         kLiftoffFrameSetupFunctionReg) ==
-  //                         std::end(wasm::kGpParamRegisters));
+// The standard library used by gcc tryjobs does not consider `std::find` to be
+// `constexpr`, so wrap it in a `#ifdef __clang__` block.
+#ifdef __clang__
+  static_assert(std::find(std::begin(wasm::kGpParamRegisters),
+                          std::end(wasm::kGpParamRegisters),
+                          kLiftoffFrameSetupFunctionReg) ==
+                std::end(wasm::kGpParamRegisters));
+#endif
 
   // On ARM, we must push at least {lr} before calling the stub, otherwise
   // it would get clobbered with no possibility to recover it.
@@ -593,7 +595,7 @@ void LiftoffAssembler::AbortCompilation() { AbortedCodeGeneration(); }
 
 // static
 constexpr int LiftoffAssembler::StaticStackFrameSize() {
-  return liftoff::kFeedbackVectorOffset;
+  return WasmLiftoffFrameConstants::kFeedbackVectorOffset;
 }
 
 int LiftoffAssembler::SlotSizeForType(ValueKind kind) {
@@ -701,22 +703,6 @@ void LiftoffAssembler::LoadTaggedPointerFromInstance(Register dst,
                                                      int offset) {
   static_assert(kTaggedSize == kSystemPointerSize);
   ldr(dst, MemOperand{instance, offset});
-}
-
-void LiftoffAssembler::LoadExternalPointer(Register dst, Register src_addr,
-                                           int offset, ExternalPointerTag tag,
-                                           Register scratch) {
-  LoadFullPointer(dst, src_addr, offset);
-}
-
-void LiftoffAssembler::LoadExternalPointer(Register dst, Register src_addr,
-                                           int offset, Register index,
-                                           ExternalPointerTag tag,
-                                           Register scratch) {
-  UseScratchRegisterScope temps(this);
-  MemOperand src_op = liftoff::GetMemOp(this, &temps, src_addr, index, offset,
-                                        kSystemPointerSizeLog2);
-  ldr(dst, src_op);
 }
 
 void LiftoffAssembler::SpillInstanceData(Register instance) {
@@ -3746,6 +3732,7 @@ void LiftoffAssembler::emit_i32x4_dot_i8x16_i7x16_add_s(LiftoffRegister dst,
                                                         LiftoffRegister lhs,
                                                         LiftoffRegister rhs,
                                                         LiftoffRegister acc) {
+  DCHECK_NE(dst, acc);
   QwNeonRegister dest = liftoff::GetSimd128Register(dst);
   QwNeonRegister left = liftoff::GetSimd128Register(lhs);
   QwNeonRegister right = liftoff::GetSimd128Register(rhs);
@@ -4433,8 +4420,8 @@ void LiftoffAssembler::emit_f64x2_qfms(LiftoffRegister dst,
   vsub(dst.high_fp(), src3.high_fp(), scratch.high());
 }
 
-void LiftoffAssembler::set_trap_on_oob_mem64(Register index, int oob_shift,
-                                             MemOperand oob_offset) {
+void LiftoffAssembler::set_trap_on_oob_mem64(Register index, uint64_t oob_size,
+                                             uint64_t oob_index) {
   UNREACHABLE();
 }
 
@@ -4763,10 +4750,12 @@ void LiftoffStackSlots::Construct(int param_slots) {
             LiftoffRegister reg =
                 slot.half_ == kLowWord ? src.reg().low() : src.reg().high();
             asm_->push(reg.gp());
-          } break;
+            break;
+          }
           case kI32:
           case kRef:
           case kRefNull:
+          case kRtt:
             asm_->push(src.reg().gp());
             break;
           case kF32:

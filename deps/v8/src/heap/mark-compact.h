@@ -26,14 +26,39 @@ class HeapObjectVisitor;
 class LargeObjectSpace;
 class LargePageMetadata;
 class MainMarkingVisitor;
+class MarkCompactCollector;
 class RecordMigratedSlotVisitor;
+
+class RootMarkingVisitor final : public RootVisitor {
+ public:
+  explicit RootMarkingVisitor(MarkCompactCollector* collector);
+  ~RootMarkingVisitor();
+
+  V8_INLINE void VisitRootPointer(Root root, const char* description,
+                                  FullObjectSlot p) final;
+
+  V8_INLINE void VisitRootPointers(Root root, const char* description,
+                                   FullObjectSlot start,
+                                   FullObjectSlot end) final;
+
+  // Keep this synced with `RootsReferencesExtractor::VisitRunningCode()`.
+  void VisitRunningCode(FullObjectSlot code_slot,
+                        FullObjectSlot istream_or_smi_zero_slot) final;
+
+  RootMarkingVisitor(const RootMarkingVisitor&) = delete;
+  RootMarkingVisitor& operator=(const RootMarkingVisitor&) = delete;
+
+ private:
+  V8_INLINE void MarkObjectByPointer(Root root, FullObjectSlot p);
+
+  MarkCompactCollector* const collector_;
+};
 
 // Collector for young and old generation.
 class MarkCompactCollector final {
  public:
   class CustomRootBodyMarkingVisitor;
   class SharedHeapObjectVisitor;
-  class RootMarkingVisitor;
 
   enum class StartCompactionMode {
     kIncremental,
@@ -43,6 +68,11 @@ class MarkCompactCollector final {
   enum class MarkingWorklistProcessingMode {
     kDefault,
     kTrackNewlyDiscoveredObjects
+  };
+
+  enum class CallOrigin {
+    kIncrementalMarkingStep,
+    kAtomicGC,
   };
 
   // Callback function for telling whether the object *p is an unmarked
@@ -160,6 +190,8 @@ class MarkCompactCollector final {
     return use_background_threads_in_cycle_;
   }
 
+  void MaybeEnableBackgroundThreadsInCycle(CallOrigin origin);
+
   Heap* heap() { return heap_; }
 
   explicit MarkCompactCollector(Heap* heap);
@@ -182,13 +214,13 @@ class MarkCompactCollector final {
 
   void MarkLiveObjects();
 
-  // Marks the object grey and adds it to the marking work list.
-  // This is for non-incremental marking only.
-  V8_INLINE void MarkObject(Tagged<HeapObject> host, Tagged<HeapObject> obj);
+  // Marks the object and adds it to the worklist.
+  V8_INLINE void MarkObject(Tagged<HeapObject> host, Tagged<HeapObject> obj,
+                            MarkingHelper::WorklistTarget target_worklist);
 
-  // Marks the object grey and adds it to the marking work list.
-  // This is for non-incremental marking only.
-  V8_INLINE void MarkRootObject(Root root, Tagged<HeapObject> obj);
+  // Marks the root object and adds it to the worklist.
+  V8_INLINE void MarkRootObject(Root root, Tagged<HeapObject> obj,
+                                MarkingHelper::WorklistTarget target_worklist);
 
   // Mark the heap roots and all objects reachable from them.
   void MarkRoots(RootVisitor* root_visitor);
@@ -247,6 +279,11 @@ class MarkCompactCollector final {
   // and deoptimize dependent code of non-live maps.
   void ClearNonLiveReferences();
   void MarkDependentCodeForDeoptimization();
+
+  // Special handling for clearing map slots.
+  // Returns true if the slot was cleared.
+  bool SpecialClearMapSlot(Tagged<HeapObject> host, Tagged<Map> dead_target,
+                           MaybeObjectSlot& location);
   // Checks if the given weak cell is a simple transition from the parent map
   // of the given dead target. If so it clears the transition and trims
   // the descriptor array of the parent if needed.
@@ -292,8 +329,12 @@ class MarkCompactCollector final {
   // Goes through the list of encountered weak references and clears those with
   // dead values. If the value is a dead map and the parent map transitions to
   // the dead map via weak cell, then this function also clears the map
-  // transition.
-  void ClearWeakReferences();
+  // transition. Trivial weak references, involving no custom weakness clearing,
+  // can be cleared via a parallel job.
+  void ClearTrivialWeakReferences();
+  void ClearNonTrivialWeakReferences();
+
+  class ClearTrivialWeakRefJobItem;
 
   // Goes through the list of encountered JSWeakRefs and WeakCells and clears
   // those with dead values.
@@ -324,8 +365,6 @@ class MarkCompactCollector final {
 
   void RightTrimDescriptorArray(Tagged<DescriptorArray> array,
                                 int descriptors_to_trim);
-
-  V8_INLINE bool ShouldMarkObject(Tagged<HeapObject>) const;
 
   void StartSweepNewSpace();
   void SweepLargeSpace(LargeObjectSpace* space);
@@ -408,6 +447,7 @@ class MarkCompactCollector final {
 
   friend class Evacuator;
   friend class RecordMigratedSlotVisitor;
+  friend class RootMarkingVisitor;
 };
 
 }  // namespace internal

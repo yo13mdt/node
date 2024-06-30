@@ -12,7 +12,7 @@
 #include "src/compiler/backend/gap-resolver.h"
 #include "src/compiler/node-matchers.h"
 #include "src/compiler/osr.h"
-#include "src/heap/mutable-page.h"
+#include "src/heap/mutable-page-metadata.h"
 
 namespace v8 {
 namespace internal {
@@ -832,8 +832,15 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       break;
     }
     case kArchPrepareCallCFunction: {
+#ifdef V8_TARGET_ARCH_RISCV64
+      int const num_gp_parameters = ParamField::decode(instr->opcode());
+      int const num_fp_parameters = FPParamField::decode(instr->opcode());
+      __ PrepareCallCFunction(num_gp_parameters, num_fp_parameters,
+                              kScratchReg);
+#else
       int const num_parameters = MiscField::decode(instr->opcode());
       __ PrepareCallCFunction(num_parameters, kScratchReg);
+#endif
       // Frame alignment requires using FP-relative frame addressing.
       frame_access_state()->SetFrameAccessToFP();
       break;
@@ -868,6 +875,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kArchPrepareTailCall:
       AssemblePrepareTailCall();
       break;
+    case kArchCallCFunctionWithFrameState:
     case kArchCallCFunction: {
       int const num_gp_parameters = ParamField::decode(instr->opcode());
       int const num_fp_parameters = FPParamField::decode(instr->opcode());
@@ -896,6 +904,12 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
                                      set_isolate_data_slots, &return_location);
       }
       RecordSafepoint(instr->reference_map(), pc_offset);
+
+      bool const needs_frame_state =
+          (arch_opcode == kArchCallCFunctionWithFrameState);
+      if (needs_frame_state) {
+        RecordDeoptInfo(instr, pc_offset);
+      }
 
       frame_access_state()->SetFrameAccessToDefault();
       // Ideally, we should decrement SP delta to match the change of stack
@@ -964,16 +978,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kArchSetStackPointer: {
       DCHECK(instr->InputAt(0)->IsRegister());
       __ Move(sp, i.InputRegister(0));
-      auto fp_scope = static_cast<wasm::FPRelativeScope>(
-          MiscField::decode(instr->opcode()));
-      if (fp_scope == wasm::kEnterFPRelativeOnlyScope) {
-        DCHECK(frame_access_state()->has_frame());
-        frame_access_state()->SetFrameAccessToFP();
-      } else {
-        frame_access_state()->SetFrameAccessToDefault();
-      }
-      frame_access_state()->SetFPRelativeOnly(fp_scope ==
-                                              wasm::kEnterFPRelativeOnlyScope);
       break;
     }
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -1278,24 +1282,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       __ Or(i.OutputRegister(), i.InputOrZeroRegister(0), i.InputOperand(1));
       __ Sll32(i.OutputRegister(), i.OutputRegister(), 0x0);
       break;
-    case kRiscvNor:
-      if (instr->InputAt(1)->IsRegister()) {
-        __ Nor(i.OutputRegister(), i.InputOrZeroRegister(0), i.InputOperand(1));
-      } else {
-        DCHECK_EQ(0, i.InputOperand(1).immediate());
-        __ Nor(i.OutputRegister(), i.InputOrZeroRegister(0), zero_reg);
-      }
-      break;
-    case kRiscvNor32:
-      if (instr->InputAt(1)->IsRegister()) {
-        __ Nor(i.OutputRegister(), i.InputOrZeroRegister(0), i.InputOperand(1));
-        __ Sll32(i.OutputRegister(), i.OutputRegister(), 0x0);
-      } else {
-        DCHECK_EQ(0, i.InputOperand(1).immediate());
-        __ Nor(i.OutputRegister(), i.InputOrZeroRegister(0), zero_reg);
-        __ Sll32(i.OutputRegister(), i.OutputRegister(), 0x0);
-      }
-      break;
     case kRiscvXor:
       __ Xor(i.OutputRegister(), i.InputOrZeroRegister(0), i.InputOperand(1));
       break;
@@ -1384,7 +1370,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       // Pseudo-instruction used for cmp/branch. No opcode emitted here.
       break;
 #endif
-#ifdef CAN_USE_ZBB_INSTRUCTIONS
     case kRiscvRev8:
       __ rev8(i.OutputRegister(), i.InputRegister(0));
       break;
@@ -1438,7 +1423,6 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kRiscvZexth:
       __ zexth(i.OutputRegister(), i.InputRegister(0));
       break;
-#endif
     case kRiscvTst32:
       __ And(kScratchReg, i.InputRegister(0), i.InputOperand(1));
       __ Sll32(kScratchReg, kScratchReg, 0x0);
@@ -1450,6 +1434,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
     case kRiscvCmp:
 #ifdef V8_TARGET_ARCH_RISCV64
     case kRiscvCmp32:
+    case kRiscvCmpZero32:
 #endif
       // Pseudo-instruction used for cmp/branch. No opcode emitted here.
       break;
@@ -2507,6 +2492,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       size_t index = 0;
       MemOperand mem = i.MemoryOperand(&index);
       __ AtomicStoreTaggedField(i.InputOrZeroRegister(index), mem);
+      break;
+    }
+    case kRiscvLoadDecompressProtected: {
+      RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
+      __ DecompressProtected(i.OutputRegister(), i.MemoryOperand());
       break;
     }
 #endif
@@ -3810,7 +3800,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
   case k##name:           \
     printf("k%s", #name); \
     break;
-        TARGET_ARCH_OPCODE_LIST(Print);
+        ARCH_OPCODE_LIST(Print);
 #undef Print
         default:
           break;
@@ -3865,7 +3855,7 @@ void AssembleBranchToLabels(CodeGenerator* gen, MacroAssembler* masm,
              instr->arch_opcode() == kRiscvSub64) {
     Condition cc = FlagsConditionToConditionOvf(condition);
     __ Sra64(kScratchReg, i.OutputRegister(), 32);
-    __ Sra64(kScratchReg2, i.OutputRegister(), 31);
+    __ Sra32(kScratchReg2, i.OutputRegister(), 31);
     __ Branch(tlabel, cc, kScratchReg2, Operand(kScratchReg));
   } else if (instr->arch_opcode() == kRiscvAddOvf64 ||
              instr->arch_opcode() == kRiscvSubOvf64) {
@@ -3932,6 +3922,17 @@ void AssembleBranchToLabels(CodeGenerator* gen, MacroAssembler* masm,
     } else if (i.InputOrZeroRegister(0) != zero_reg) {
       __ Branch(tlabel, cc, i.InputRegister(0), Operand(zero_reg));
     }
+#ifdef V8_TARGET_ARCH_RISCV64
+  } else if (instr->arch_opcode() == kRiscvCmpZero32) {
+    Condition cc = FlagsConditionToConditionCmp(condition);
+    if (i.InputOrZeroRegister(0) == zero_reg && IsInludeEqual(cc)) {
+      __ Branch(tlabel);
+    } else if (i.InputOrZeroRegister(0) != zero_reg) {
+      Register temp0 = i.TempRegister(0);
+      __ slliw(temp0, i.InputRegister(0), 0);
+      __ Branch(tlabel, cc, temp0, Operand(zero_reg));
+    }
+#endif
   } else if (instr->arch_opcode() == kArchStackPointerGreaterThan) {
     Condition cc = FlagsConditionToConditionCmp(condition);
     Register lhs_register = sp;
@@ -3952,8 +3953,8 @@ void AssembleBranchToLabels(CodeGenerator* gen, MacroAssembler* masm,
       __ BranchFalseF(kScratchReg, tlabel);
     }
   } else {
-    PrintF("AssembleArchBranch Unimplemented arch_opcode: %d\n",
-           instr->arch_opcode());
+    std::cout << "AssembleArchBranch Unimplemented arch_opcode:"
+              << instr->arch_opcode() << " " << condition << std::endl;
     UNIMPLEMENTED();
   }
   if (!fallthru) __ Branch(flabel);  // no fallthru to flabel.
@@ -4226,6 +4227,72 @@ void CodeGenerator::AssembleArchBoolean(Instruction* instr,
         UNREACHABLE();
     }
     return;
+#ifdef V8_TARGET_ARCH_RISCV64
+  } else if (instr->arch_opcode() == kRiscvCmpZero32) {
+    auto trim_reg = [&](Register in) -> Register {
+        Register temp = i.TempRegister(0);
+        __ slliw(temp, in, 0);
+        return temp;
+    };
+    auto trim_op = [&](Operand in) -> Register {
+        Register temp = i.TempRegister(0);
+        if (in.is_reg()) {
+          __ slliw(temp, in.rm(), 0);
+        } else {
+          __ Li(temp, in.immediate());
+          __ slliw(temp, temp, 0);
+        }
+        return temp;
+    };
+    Condition cc = FlagsConditionToConditionCmp(condition);
+    switch (cc) {
+      case eq: {
+        auto left = trim_reg(i.InputOrZeroRegister(0));
+        __ Sltu(result, left, 1);
+        break;
+      }
+      case ne: {
+        auto left = trim_reg(i.InputOrZeroRegister(0));
+        __ Sltu(result, zero_reg, left);
+        break;
+      }
+      case lt:
+      case ge: {
+        auto left = trim_reg(i.InputOrZeroRegister(0));
+        __ Slt(result, left, zero_reg);
+        if (cc == ge) {
+          __ Xor(result, result, 1);
+        }
+      } break;
+      case gt:
+      case le: {
+        auto left = trim_op(i.InputOperand(0));
+        __ Slt(result, zero_reg, left);
+        if (cc == le) {
+          __ Xor(result, result, 1);
+        }
+      } break;
+      case Uless:
+      case Ugreater_equal: {
+        auto left = trim_reg(i.InputOrZeroRegister(0));
+        __ Sltu(result, left, zero_reg);
+        if (cc == Ugreater_equal) {
+          __ Xor(result, result, 1);
+        }
+      } break;
+      case Ugreater:
+      case Uless_equal: {
+        auto right = trim_op(i.InputOperand(0));
+        __ Sltu(result, zero_reg, right);
+        if (cc == Uless_equal) {
+          __ Xor(result, result, 1);
+        }
+      } break;
+      default:
+        UNREACHABLE();
+    }
+    return;
+#endif
   } else if (instr->arch_opcode() == kArchStackPointerGreaterThan) {
     Register lhs_register = sp;
     uint32_t offset;
@@ -4268,6 +4335,15 @@ void CodeGenerator::AssembleArchBoolean(Instruction* instr,
     TRACE_UNIMPL();
     UNIMPLEMENTED();
   }
+}
+
+void CodeGenerator::AssembleArchConditionalBoolean(Instruction* instr) {
+  UNREACHABLE();
+}
+
+void CodeGenerator::AssembleArchConditionalBranch(Instruction* instr,
+                                                  BranchInfo* branch) {
+  UNREACHABLE();
 }
 
 void CodeGenerator::AssembleArchBinarySearchSwitch(Instruction* instr) {
@@ -4392,8 +4468,7 @@ void CodeGenerator::AssembleConstructFrame() {
           (v8_flags.stack_size * KB)) {
         UseScratchRegisterScope temps(masm());
         Register stack_limit = temps.Acquire();
-        __ LoadStackLimit(stack_limit,
-                          MacroAssembler::StackLimitKind::kRealStackLimit);
+        __ LoadStackLimit(stack_limit, StackLimitKind::kRealStackLimit);
         __ AddWord(stack_limit, stack_limit,
                  Operand(required_slots * kSystemPointerSize));
         __ Branch(&done, uge, sp, Operand(stack_limit));

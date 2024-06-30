@@ -132,15 +132,18 @@ Node* GraphAssembler::LoadFramePointer() {
   return AddNode(graph()->NewNode(machine()->LoadFramePointer()));
 }
 
+Node* GraphAssembler::LoadRootRegister() {
+  return AddNode(graph()->NewNode(machine()->LoadRootRegister()));
+}
+
 #if V8_ENABLE_WEBASSEMBLY
 Node* GraphAssembler::LoadStackPointer() {
   return AddNode(graph()->NewNode(machine()->LoadStackPointer(), effect()));
 }
 
-Node* GraphAssembler::SetStackPointer(Node* node,
-                                      wasm::FPRelativeScope fp_scope) {
+Node* GraphAssembler::SetStackPointer(Node* node) {
   return AddNode(
-      graph()->NewNode(machine()->SetStackPointer(fp_scope), node, effect()));
+      graph()->NewNode(machine()->SetStackPointer(), node, effect()));
 }
 #endif
 

@@ -6,11 +6,12 @@
 #define V8_WASM_BASELINE_S390_LIFTOFF_ASSEMBLER_S390_INL_H_
 
 #include "src/codegen/assembler.h"
-#include "src/heap/mutable-page.h"
+#include "src/heap/mutable-page-metadata.h"
 #include "src/wasm/baseline/liftoff-assembler.h"
 #include "src/wasm/baseline/parallel-move-inl.h"
 #include "src/wasm/object-access.h"
 #include "src/wasm/simd-shuffle.h"
+#include "src/wasm/wasm-linkage.h"
 #include "src/wasm/wasm-objects.h"
 
 namespace v8::internal::wasm {
@@ -41,14 +42,12 @@ namespace liftoff {
 //       |                    |   v
 //  -----+--------------------+  <-- stack ptr (sp)
 //
-constexpr int32_t kInstanceDataOffset = 2 * kSystemPointerSize;
-constexpr int kFeedbackVectorOffset = 3 * kSystemPointerSize;
 inline MemOperand GetStackSlot(uint32_t offset) {
   return MemOperand(fp, -offset);
 }
 
 inline MemOperand GetInstanceDataOperand() {
-  return GetStackSlot(kInstanceDataOffset);
+  return GetStackSlot(WasmLiftoffFrameConstants::kInstanceDataOffset);
 }
 
 inline void StoreToMemory(LiftoffAssembler* assm, MemOperand dst,
@@ -101,11 +100,15 @@ int LiftoffAssembler::PrepareStackFrame() {
 }
 
 void LiftoffAssembler::CallFrameSetupStub(int declared_function_index) {
-  // TODO(jkummerow): Enable this check when we have C++20.
-  // static_assert(std::find(std::begin(wasm::kGpParamRegisters),
-  //                         std::end(wasm::kGpParamRegisters),
-  //                         kLiftoffFrameSetupFunctionReg) ==
-  //                         std::end(wasm::kGpParamRegisters));
+// The standard library used by gcc tryjobs does not consider `std::find` to be
+// `constexpr`, so wrap it in a `#ifdef __clang__` block.
+#ifdef __clang__
+  static_assert(std::find(std::begin(wasm::kGpParamRegisters),
+                          std::end(wasm::kGpParamRegisters),
+                          kLiftoffFrameSetupFunctionReg) ==
+                std::end(wasm::kGpParamRegisters));
+#endif
+
   // On ARM, we must push at least {lr} before calling the stub, otherwise
   // it would get clobbered with no possibility to recover it.
   Register scratch = ip;
@@ -217,7 +220,7 @@ void LiftoffAssembler::AbortCompilation() { AbortedCodeGeneration(); }
 
 // static
 constexpr int LiftoffAssembler::StaticStackFrameSize() {
-  return liftoff::kFeedbackVectorOffset;
+  return WasmLiftoffFrameConstants::kFeedbackVectorOffset;
 }
 
 int LiftoffAssembler::SlotSizeForType(ValueKind kind) {
@@ -314,20 +317,6 @@ void LiftoffAssembler::LoadTaggedPointerFromInstance(Register dst,
                                                      int offset) {
   DCHECK_LE(0, offset);
   LoadTaggedField(dst, MemOperand(instance, offset));
-}
-
-void LiftoffAssembler::LoadExternalPointer(Register dst, Register src_addr,
-                                           int offset, ExternalPointerTag tag,
-                                           Register /* scratch */) {
-  LoadFullPointer(dst, src_addr, offset);
-}
-
-void LiftoffAssembler::LoadExternalPointer(Register dst, Register src_addr,
-                                           int offset, Register index,
-                                           ExternalPointerTag tag,
-                                           Register scratch) {
-  ShiftLeftU64(scratch, index, Operand(kSystemPointerSizeLog2));
-  LoadU64(dst, MemOperand(src_addr, scratch, offset));
 }
 
 void LiftoffAssembler::SpillInstanceData(Register instance) {
@@ -2226,6 +2215,18 @@ void LiftoffAssembler::emit_i32_cond_jumpi(Condition cond, Label* label,
   b(to_condition(cond), label);
 }
 
+void LiftoffAssembler::emit_ptrsize_cond_jumpi(Condition cond, Label* label,
+                                               Register lhs, int32_t imm,
+                                               const FreezeCacheState& frozen) {
+  bool use_signed = is_signed(cond);
+  if (use_signed) {
+    CmpS64(lhs, Operand(imm));
+  } else {
+    CmpU64(lhs, Operand(imm));
+  }
+  b(to_condition(cond), label);
+}
+
 #define EMIT_EQZ(test, src) \
   {                         \
     Label done;             \
@@ -2316,6 +2317,8 @@ void LiftoffAssembler::emit_smi_check(Register obj, Label* target,
   Condition condition = mode == kJumpOnSmi ? eq : ne;
   b(condition, target);  // branch if SMI
 }
+
+void LiftoffAssembler::clear_i32_upper_half(Register dst) { LoadU32(dst, dst); }
 
 #define SIMD_BINOP_RR_LIST(V)                        \
   V(f64x2_add, F64x2Add)                             \
@@ -2996,8 +2999,8 @@ void LiftoffAssembler::emit_s128_relaxed_laneselect(LiftoffRegister dst,
   emit_s128_select(dst, src1, src2, mask);
 }
 
-void LiftoffAssembler::set_trap_on_oob_mem64(Register index, int oob_shift,
-                                             MemOperand oob_offset) {
+void LiftoffAssembler::set_trap_on_oob_mem64(Register index, uint64_t oob_size,
+                                             uint64_t oob_index) {
   UNREACHABLE();
 }
 

@@ -37,14 +37,14 @@
 #define ABSL_CONTAINER_NODE_HASH_MAP_H_
 
 #include <cstddef>
-#include <tuple>
+#include <memory>
 #include <type_traits>
 #include <utility>
 
 #include "absl/algorithm/container.h"
-#include "absl/base/macros.h"
+#include "absl/base/attributes.h"
+#include "absl/container/hash_container_defaults.h"
 #include "absl/container/internal/container_memory.h"
-#include "absl/container/internal/hash_function_defaults.h"  // IWYU pragma: export
 #include "absl/container/internal/node_slot_policy.h"
 #include "absl/container/internal/raw_hash_map.h"  // IWYU pragma: export
 #include "absl/memory/memory.h"
@@ -114,11 +114,10 @@ class NodeHashMapPolicy;
 //  if (result != ducks.end()) {
 //    std::cout << "Result: " << result->second << std::endl;
 //  }
-template <class Key, class Value,
-          class Hash = absl::container_internal::hash_default_hash<Key>,
-          class Eq = absl::container_internal::hash_default_eq<Key>,
+template <class Key, class Value, class Hash = DefaultHashContainerHash<Key>,
+          class Eq = DefaultHashContainerEq<Key>,
           class Alloc = std::allocator<std::pair<const Key, Value>>>
-class node_hash_map
+class ABSL_INTERNAL_ATTRIBUTE_OWNER node_hash_map
     : public absl::container_internal::raw_hash_map<
           absl::container_internal::NodeHashMapPolicy<Key, Value>, Hash, Eq,
           Alloc> {
